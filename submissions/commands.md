@@ -1,3 +1,17 @@
+# NAdamW baseline for MNIST workload
+
+python3 submission_runner.py \
+    --framework=pytorch \
+    --workload=mnist \
+    --experiment_dir=/home/ashishrao/redo_optimizer/experiment-dir \
+    --experiment_name=nadamw \
+    --submission_path=reference_algorithms/paper_baselines/nadamw/pytorch/submission.py \
+    --tuning_search_space=reference_algorithms/paper_baselines/nadamw/tuning_search_space.json \
+    --num_tuning_trials=3 \
+    --tuning_ruleset=external \
+    --overwrite=True \
+    --use_wandb=True
+
 # ReDO + NAdamW for MNIST workload
 
 python3 submission_runner.py \

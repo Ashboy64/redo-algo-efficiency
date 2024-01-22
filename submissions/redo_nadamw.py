@@ -1,4 +1,11 @@
-"""Submission file for an NAdamW optimizer with warmup+cosine LR in PyTorch."""
+"""Submission file for a ReDO NAdamW optimizer with warmup+cosine LR in PyTorch.
+
+PROBLEMS:
+- Only supports linear layers.
+- Assumes that the last linear layer corresponds to the output layer.
+- Assumes that the activation functions after the linear layer are Sigmoids.
+- Performance: regular NAdamW beats this.
+"""
 
 import math
 from typing import Dict, Iterator, List, Tuple
@@ -220,12 +227,15 @@ def init_optimizer_state(workload: spec.Workload,
   }
 
   # Add the model's initial linear parameters to the optimizer state.
+  num_fc_layers = 0
+
   for submodule in model_params.modules():
     if type(submodule) == nn.Linear:
       optimizer_state['init_weight_params'][submodule] = \
         submodule.weight.data.detach().clone()
       optimizer_state['init_bias_params'][submodule] = \
         submodule.bias.data.detach().clone()
+      num_fc_layers += 1
 
   def pytorch_cosine_warmup(step_hint: int, hyperparameters, optimizer):
     warmup_steps = int(hyperparameters.warmup_factor * step_hint)
@@ -239,12 +249,11 @@ def init_optimizer_state(workload: spec.Workload,
   optimizer_state['scheduler'] = pytorch_cosine_warmup(
       workload.step_hint, hyperparameters, optimizer_state['optimizer'])
   
-  # Register hooks for all linear layers in the model.
+  # Register hooks for all linear layers in the model. Assume the last fc layer
+  # is the output layer, so don't register a hook for it.
   def update_fc_stats(fc_layer, args, layer_output):
     with torch.no_grad():
-      curr_variances = torch.var(F.relu(layer_output), dim=0)
-
-      # print(f"CURR VARIANCE IS {curr_variances}")
+      curr_variances = torch.var(F.sigmoid(layer_output), dim=0)
 
       if fc_layer not in optimizer_state['fc_variance_emas']:
         optimizer_state['fc_variance_emas'][fc_layer] = curr_variances
@@ -256,9 +265,13 @@ def init_optimizer_state(workload: spec.Workload,
         (1. - optimizer_state['ema_weight']) * curr_variances
       optimizer_state['fc_variance_emas'][fc_layer] = first_term + second_term
 
+  num_hooks_registered = 0
   for submodule in model_params.modules():
     if type(submodule) == nn.Linear:
+      # print(submodule.weight.shape)
       submodule.register_forward_hook(update_fc_stats)
+      num_hooks_registered += 1
+      if num_hooks_registered == num_fc_layers - 1: break
 
   return optimizer_state
 
@@ -275,8 +288,6 @@ def reset_inactive_params(model, optimizer_state):
       submodule.weight[reset_mask, :].copy_(
         optimizer_state['init_weight_params'][submodule][reset_mask, :]
       )
-      # print(submodule.bias.shape)
-      # print(optimizer_state['init_bias_params'][submodule].shape)
 
       submodule.bias[reset_mask].copy_(
         optimizer_state['init_bias_params'][submodule][reset_mask]
@@ -343,34 +354,33 @@ def update_params(workload: spec.Workload,
 
   # Log training metrics - loss, grad_norm, batch_size.
   if global_step <= 100 or global_step % 500 == 0:
+
+    metrics_dict = {}
+
     with torch.no_grad():
       parameters = [p for p in current_model.parameters() if p.grad is not None]
       grad_norm = torch.norm(
           torch.stack([torch.norm(p.grad.detach(), 2) for p in parameters]), 2)
+      
+      metrics_dict['loss'] = loss.item()
+      metrics_dict['grad_norm'] = grad_norm.item()
+
+      for idx, submodule in enumerate(current_model.modules()):
+          if submodule in optimizer_state['fc_variance_emas']:
+            curr_variances = optimizer_state['fc_variance_emas'][submodule]
+            mean_variance = torch.mean(curr_variances)
+            min_variance = torch.min(curr_variances)
+
+            metrics_dict[f'submodule_{idx}-mean_variance'] = mean_variance
+            metrics_dict[f'submodule_{idx}-min_variance'] = min_variance
+    
     if workload.metrics_logger is not None:
-      workload.metrics_logger.append_scalar_metrics(
-          {
-              'loss': loss.item(),
-              'grad_norm': grad_norm.item(),
-          }, global_step)
+      workload.metrics_logger.append_scalar_metrics(metrics_dict, global_step)
+    
     logging.info('%d) loss = %0.3f, grad_norm = %0.3f',
                  global_step,
                  loss.item(),
                  grad_norm.item())
-
-  # Log mean and min variance for each layer.
-  with torch.no_grad():
-    for idx, submodule in enumerate(current_model.modules()):
-      if submodule in optimizer_state['fc_variance_emas']:
-        curr_variances = optimizer_state['fc_variance_emas'][submodule]
-        mean_variance = torch.mean(curr_variances)
-        min_variance = torch.min(curr_variances)
-
-        workload.metrics_logger.append_scalar_metrics(
-          {
-              f'submodule_{idx}-mean_variance': mean_variance,
-              f'submodule_{idx}-min_variance': min_variance,
-          }, global_step)
 
   # Reset neurons with low variance.
   reset_inactive_params(current_param_container, optimizer_state)
